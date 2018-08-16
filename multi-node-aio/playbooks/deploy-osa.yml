@@ -40,6 +40,7 @@
         force: true
       when:
         - pre_config_osa | default(true) | bool
+        - clone_osa | default(true) | bool
 
     - name: Create base directories
       file:
@@ -109,6 +110,7 @@
         chdir: /opt/openstack-ansible
       when:
         - pre_config_osa | default(true) | bool
+        - bootstrap_ansible | default(true) | bool
 
     - name: Get pip2 and pw gen deps
       shell: |
