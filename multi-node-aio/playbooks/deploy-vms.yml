@@ -13,7 +13,197 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-- name: Gather facts
+- name: Gather Facts for vm_hosts
+  hosts: vm_hosts
+  gather_facts: yes
+
+  tasks:
+    - name: Get info about the virt storage pools
+      virt_pool:
+        command: info
+      register: _virt_pools
+
+    - name: Set virt_pools host fact
+      set_fact:
+        virt_pools: "{{ _virt_pools }}"
+
+- name: Prepare & Create VMs
+  hosts: pxe_servers
+  gather_facts: no
+  environment: "{{ deployment_environment_variables | default({}) }}"
+  tags:
+    - deploy-vms
+  tasks:
+
+    - name: Stop running VMs
+      virt:
+        name: "{{ server_hostname }}"
+        command: destroy
+      failed_when: false
+      when:
+        - server_vm | default(false) | bool
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['vm_hosts'] }}"
+
+    - name: Delete VM LV
+      lvol:
+        vg: "{{ default_vm_disk_vg }}"
+        lv: "{{ server_hostname }}"
+        state: absent
+        force: yes
+      failed_when: false
+      when:
+        - server_vm | default(false) | bool
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['vm_hosts'] }}"
+
+    - name: Delete VM Disk Image
+      file:
+        path: "{{ hostvars[item]['virt_pools'].pools.default.path | default('/data/images') }}/{{ server_hostname }}.img"
+        state: absent
+      when:
+        - server_vm | default(false) | bool
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['vm_hosts'] }}"
+
+    - name: Undefine the VM
+      virt:
+        name: "{{ server_hostname }}"
+        command: undefine
+      failed_when: false
+      when:
+        - server_vm | default(false) | bool
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['vm_hosts'] }}"
+
+    - name: Create VM LV
+      lvol:
+        vg: "{{ default_vm_disk_vg }}"
+        lv: "{{ server_hostname }}"
+        size: "{{ default_vm_storage }}"
+      when:
+        - server_vm | default(false) | bool
+        - default_vm_disk_mode == "lvm"
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['vm_hosts'] }}"
+
+    - name: Setup file-based disk images
+      when:
+        - default_vm_disk_mode == "file"
+      block:
+        - name: Find existing base image files
+          find:
+            paths: "{{ hostvars[item]['virt_pools'].pools.default.path | default('/data/images') }}"
+            patterns: '*-base.img'
+          register: _base_images
+          delegate_to: "{{ item }}"
+          with_items: "{{ groups['vm_hosts'] }}"
+
+        - name: Set vm_use_snapshot if it's not defined
+          set_fact:
+            vm_use_snapshot: "{{ _base_images['matched'] > 0 }}"
+          when:
+            - not (vm_use_snapshot | bool)
+          delegate_to: "{{ item }}"
+          with_items: "{{ groups['vm_hosts'] }}"
+
+        - name: Create VM Disk Image
+          command: >-
+            qemu-img create
+            -f qcow2
+            {% if vm_use_snapshot | bool %}
+            -b {{ hostvars[item]['virt_pools'].pools.default.path | default('/data/images') }}/{{ server_hostname }}-base.img
+            {% endif %}
+            {{ hostvars[item]['virt_pools'].pools.default.path | default('/data/images') }}/{{ server_hostname }}.img
+            {{ default_vm_storage }}m
+          when:
+            - server_vm | default(false) | bool
+          delegate_to: "{{ item }}"
+          with_items: "{{ groups['vm_hosts'] }}"
+
+    # Note (odyssey4me):
+    # This will only work on a host which has
+    # libguestfs >= 1.35.2 and >= 1.34.1
+    # Ubuntu bionic works, but xenial does not (even with UCA).
+    # ref: https://bugs.launchpad.net/ubuntu/+source/libguestfs/+bug/1615337.
+    - name: Prepare file-based disk images
+      when:
+        - default_vm_disk_mode == "file"
+        - vm_use_snapshot | bool
+      block:
+        - name: Inject the host ssh key into the VM disk image
+          command: >-
+            virt-sysprep
+            --enable customize
+            --ssh-inject root:file:/root/.ssh/id_rsa.pub
+            --add {{ hostvars[item]['virt_pools'].pools.default.path | default('/data/images') }}/{{ hostvars[item]['server_hostname'] }}.img
+          when:
+            - hostvars[item]['server_vm'] | default(false) | bool
+          with_items: "{{ groups['pxe_servers'] }}"
+
+        - name: Copy over prepare-image-galera.sh
+          copy:
+            src: kvm/prepare-image-galera.sh
+            dest: /opt/prepare-image-galera.sh
+            mode: "0755"
+
+        - name: Prepare the galera containers for startup
+          command: /opt/prepare-image-galera.sh
+          register: _galera_prepare
+
+        # guestfissh does not always give a return code which indicates
+        # failure, so we look for our final stdout output as an indicator
+        - name: Fail if the preparation script did not complete
+          fail:
+            msg: "The galera container preparation failed."
+          when:
+            - "'Image preparation completed.' not in _galera_prepare.stdout_lines"
+
+    - name: Wait for guest capabilities to appear
+      command: "virsh capabilities"
+      register: virsh_caps
+      until: "'<guest>' in virsh_caps.stdout"
+      retries: 6
+      delay: 10
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['vm_hosts'] }}"
+
+    - name: Define the VM
+      virt:
+        name: "{{ server_hostname }}"
+        command: define
+        xml: >-
+          {%- if vm_use_snapshot | bool %}
+          {{ lookup('file', hostvars[item]['virt_pools'].pools.default.path | default('/data/images') ~ '/' ~ hostvars[item]['server_hostname'] ~ '.xml') }}
+          {%- else %}
+          {{ lookup('template', 'kvm/kvm-vm.xml.j2') }}
+          {%- endif %}
+      failed_when: false
+      when:
+        - server_vm | default(false) | bool
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['vm_hosts'] }}"
+
+    - name: Get the VM xml
+      virt:
+        command: get_xml
+        name: "{{ server_hostname }}"
+      register: vm_xml
+      when:
+        - server_vm | default(false) | bool
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['vm_hosts'] }}"
+
+    - name: Write the VM xml
+      copy:
+        content: "{{ item.1.get_xml }}"
+        dest: "/etc/libvirt/qemu/{{ item.1.item }}.xml"
+      delegate_to: "{{ item.0 }}"
+      with_nested:
+        - "{{ groups['vm_hosts'] }}"
+        - "{{ vm_xml.results }}"
+
+- name: Start VMs
   hosts: vm_hosts
   gather_facts: "{{ gather_facts | default(true) }}"
   environment: "{{ deployment_environment_variables | default({}) }}"
@@ -30,115 +220,6 @@
         - "{{ playbook_dir }}/vars/{{ ansible_os_family | lower }}.yml"
       tags:
         - always
-
-    - name: Stop running VMs
-      virt:
-        name: "{{ hostvars[item]['server_hostname'] }}"
-        command: destroy
-      failed_when: false
-      when:
-        - hostvars[item]['server_vm'] | default(false) | bool
-      with_items: "{{ groups['pxe_servers'] }}"
-
-    - name: Delete VM LV
-      lvol:
-        vg: "{{ default_vm_disk_vg }}"
-        lv: "{{ hostvars[item]['server_hostname'] }}"
-        state: absent
-        force: yes
-      failed_when: false
-      when:
-        - hostvars[item]['server_vm'] | default(false) | bool
-      with_items: "{{ groups['pxe_servers'] }}"
-
-    - name: Delete VM Disk Image
-      file:
-        path: "/var/lib/libvirt/images/{{ hostvars[item]['server_hostname'] }}.img"
-        state: absent
-      when:
-        - hostvars[item]['server_vm'] | default(false) | bool
-      with_items: "{{ groups['pxe_servers'] }}"
-
-    - name: Undefine the VM
-      virt:
-        name: "{{ hostvars[item]['server_hostname'] }}"
-        command: undefine
-      failed_when: false
-      when:
-        - hostvars[item]['server_vm'] | default(false) | bool
-      with_items: "{{ groups['pxe_servers'] }}"
-
-    - name: Create VM LV
-      lvol:
-        vg: "{{ default_vm_disk_vg }}"
-        lv: "{{ hostvars[item]['server_hostname'] }}"
-        size: "{{ default_vm_storage }}"
-      when:
-        - hostvars[item]['server_vm'] | default(false) | bool
-        - default_vm_disk_mode == "lvm"
-      with_items: "{{ groups['pxe_servers'] }}"
-
-    - name: Setup file-based disk images
-      when:
-        - default_vm_disk_mode == "file"
-      block:
-        - name: Find existing base image files
-          find:
-            paths: /var/lib/libvirt/images
-            patterns: '*-base.img'
-          register: _base_images
-
-        - name: Set vm_use_snapshot if it's not defined
-          set_fact:
-            vm_use_snapshot: "{{ _base_images['matched'] > 0 }}"
-          when:
-            - vm_use_snapshot is not defined
-
-        - name: Create VM Disk Image
-          command: >-
-            qemu-img create
-            -f qcow2
-            {% if vm_use_snapshot | bool %}
-            -b /var/lib/libvirt/images/{{ hostvars[item]['server_hostname'] }}-base.img
-            {% endif %}
-            /var/lib/libvirt/images/{{ hostvars[item]['server_hostname'] }}.img
-            {{ default_vm_storage }}m
-          when:
-            - hostvars[item]['server_vm'] | default(false) | bool
-          with_items: "{{ groups['pxe_servers'] }}"
-
-    - name: Wait for guest capabilities to appear
-      command: "virsh capabilities"
-      register: virsh_caps
-      until: "'<guest>' in virsh_caps.stdout"
-      retries: 6
-      delay: 10
-
-    - name: Define the VM
-      virt:
-        name: "{{ hostvars[item]['server_hostname'] }}"
-        command: define
-        xml: "{{ lookup('template', 'kvm/kvm-vm.xml.j2') }}"
-      failed_when: false
-      when:
-        - hostvars[item]['server_vm'] | default(false) | bool
-      with_items: "{{ groups['pxe_servers'] }}"
-
-    - name: Get the VM xml
-      virt:
-        command: get_xml
-        name: "{{ hostvars[item]['server_hostname'] }}"
-      register: vm_xml
-      when:
-        - hostvars[item]['server_vm'] | default(false) | bool
-      with_items: "{{ groups['pxe_servers'] }}"
-
-    - name: Write the VM xml
-      copy:
-        content: "{{ item.get_xml }}"
-        dest: "/etc/libvirt/qemu/{{ item.item }}.xml"
-      with_items: "{{ vm_xml.results }}"
-
     - name: Start the VM
       virt:
         name: "{{ hostvars[item]['server_hostname'] }}"
